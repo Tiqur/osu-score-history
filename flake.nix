@@ -19,17 +19,26 @@
             pythonPackages.pip
             pythonPackages.setuptools
             pythonPackages.wheel
+            pythonPackages.requests  # Ensure requests is available
           ];
           shellHook = ''
             python -m venv .venv
             source .venv/bin/activate
-            pip install ossapi
-            pip install dotenv
+            pip install ossapi dotenv requests
 
-            #if [ -f requirements.txt ]; then
-            #  pip install -r requirements.txt
-            #fi
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt
+            fi
           '';
+        };
+
+        apps.default = {
+          type = "app";
+          program = toString (pkgs.writeShellScript "run-main" ''
+            #!/bin/sh
+            source .venv/bin/activate
+            python main.py
+          '');
         };
       });
 }
