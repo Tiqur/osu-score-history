@@ -38,11 +38,11 @@ def get_oauth_token(client_id, client_secret):
         print(response.text)
         sys.exit(1)
 
-def get_scores(token, ruleset="osu", params=None):
+def get_user_scores(token, user, type="recent", params=None):
     """
-    Get scores from osu! API
+    Get scores for a specific user from osu! API
     """
-    url = "https://osu.ppy.sh/api/v2/scores"
+    url = f"https://osu.ppy.sh/api/v2/users/{user}/scores/{type}"
 
     headers = {
         "Content-Type": "application/json",
@@ -50,8 +50,8 @@ def get_scores(token, ruleset="osu", params=None):
         "Authorization": f"Bearer {token}"
     }
 
-    # Initialize query parameters with ruleset
-    query_params = {"ruleset": ruleset}
+    # Initialize query parameters
+    query_params = {"limit": 1000}
 
     # Add any additional parameters
     if params:
@@ -62,16 +62,24 @@ def get_scores(token, ruleset="osu", params=None):
     if response.status_code == 200:
         return response.json()
     else:
-        print(f"Error getting scores: {response.status_code}")
+        print(f"Error getting scores for user {user}: {response.status_code}")
         print(response.text)
         return None
 
-def generate_score_hash(score):
+def generate_score_hash(score_data):
     """
     Generate a unique hash for a score to prevent duplicates
+    
+    Can work with either a score API response or a CSV row
     """
+    # Extract the necessary fields, handling both API response and CSV row
+    score_id = str(score_data.get('id', ''))
+    user_id = str(score_data.get('user_id', ''))
+    beatmap_id = str(score_data.get('beatmap_id', ''))
+    created_at = str(score_data.get('created_at', ''))
+    
     # Create a string with the most important identifying information
-    unique_string = f"{score.get('id', '')}{score.get('user_id', '')}{score.get('beatmap_id', '')}{score.get('created_at', '')}"
+    unique_string = f"{score_id}{user_id}{beatmap_id}{created_at}"
     
     # Generate a hash
     return hashlib.md5(unique_string.encode()).hexdigest()
@@ -81,61 +89,70 @@ def load_existing_scores(output_file):
     Load existing scores from CSV to prevent duplicates
     """
     existing_hashes = set()
-    
+    score_ids = set()
+
     if os.path.isfile(output_file) and os.path.getsize(output_file) > 0:
         try:
-            with open(output_file, 'r', newline='') as f:
+            with open(output_file, 'r', newline='', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    # Create a hash from the stored data
-                    unique_string = f"{row.get('id', '')}{row.get('user_id', '')}{row.get('beatmap_id', '')}{row.get('created_at', '')}"
-                    score_hash = hashlib.md5(unique_string.encode()).hexdigest()
+                    # Add score ID to our set for a simpler duplicate check
+                    if 'id' in row and row['id']:
+                        score_ids.add(str(row['id']))
+                    
+                    # Also create a hash for more robust checking
+                    score_hash = generate_score_hash(row)
                     existing_hashes.add(score_hash)
+            
+            print(f"Successfully loaded {len(existing_hashes)} existing scores from {output_file}")
         except Exception as e:
             print(f"Warning: Could not read existing scores: {e}")
-    
-    return existing_hashes
 
-def process_scores_for_users(scores_data, users, output_file, existing_hashes):
+    return existing_hashes, score_ids
+
+def process_scores(scores_data, output_file, existing_hashes, existing_ids):
     """
-    Process scores and append those from target users to CSV,
-    avoiding duplicates using the hash set
+    Process scores and append them to CSV,
+    avoiding duplicates using the hash set and ID set
     """
-    # Convert users to a set for O(1) lookup
-    user_set = set(users)
-    
     # Extract scores from the response
-    if isinstance(scores_data, dict) and 'scores' in scores_data:
-        scores = scores_data['scores']
-    else:
-        scores = scores_data
-    
-    if not scores or not isinstance(scores, list) or len(scores) == 0:
+    if not scores_data or not isinstance(scores_data, list) or len(scores_data) == 0:
         print("No valid scores data found")
-        return 0, []
-    
-    # Find scores that match our users and aren't duplicates
-    matching_scores = []
+        return 0, [], []
+
+    # Find scores that aren't duplicates
+    new_scores = []
     new_hashes = set()
-    
-    for score in scores:
-        if score.get('user_id') in user_set:
-            score_hash = generate_score_hash(score)
-            if score_hash not in existing_hashes:
-                matching_scores.append(score)
-                new_hashes.add(score_hash)
-    
-    if not matching_scores:
-        print("No new scores found for tracked users")
-        return 0, []
-    
+    new_ids = set()
+
+    for score in scores_data:
+        # Get the score ID for a quick check
+        score_id = str(score.get('id', ''))
+        
+        # Skip if we've already seen this ID
+        if score_id in existing_ids:
+            continue
+            
+        # Generate a hash for more thorough checking
+        score_hash = generate_score_hash(score)
+        
+        # If neither the ID nor hash exists, it's a new score
+        if score_hash not in existing_hashes:
+            new_scores.append(score)
+            new_hashes.add(score_hash)
+            new_ids.add(score_id)
+
+    if not new_scores:
+        print("No new scores found")
+        return 0, [], []
+
     # Prepare scores for CSV
     all_fields = set()
     flat_scores = []
-    
-    for score in matching_scores:
+
+    for score in new_scores:
         flat_score = {}
-        
+
         # Process each field in the score
         for key, value in score.items():
             if isinstance(value, dict):
@@ -152,28 +169,49 @@ def process_scores_for_users(scores_data, users, output_file, existing_hashes):
             else:
                 flat_score[key] = value
                 all_fields.add(key)
-        
+
         flat_scores.append(flat_score)
-    
+
     # Check if the file exists to determine if we need to write headers
     file_exists = os.path.isfile(output_file) and os.path.getsize(output_file) > 0
-    
+
+    # Get existing headers if file exists
+    existing_fields = []
+    if file_exists:
+        try:
+            with open(output_file, 'r', newline='', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                existing_fields = next(reader)  # Get header row
+        except Exception as e:
+            print(f"Warning: Could not read existing headers: {e}")
+
+    # Combine existing fields with new fields
+    if existing_fields:
+        all_fields.update(existing_fields)
+
     # Append to CSV
-    with open(output_file, 'a', newline='') as f:
+    with open(output_file, 'a', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=sorted(all_fields))
         if not file_exists:
             writer.writeheader()
         writer.writerows(flat_scores)
-    
-    print(f"Added {len(flat_scores)} new scores from tracked users to {output_file}")
-    return len(flat_scores), new_hashes
+
+    print(f"Added {len(flat_scores)} new scores to {output_file}")
+    return len(flat_scores), new_hashes, new_ids
 
 def main():
     # Load credentials from .env file
-    client_id = os.getenv('OSU_CLIENT_ID') 
+    client_id = os.getenv('OSU_CLIENT_ID')
     client_secret = os.getenv('OSU_CLIENT_SECRET')
     output_file = os.getenv('CSV_OUTPUT_FILE', 'scores.csv')
     
+    # Get polling interval from env or default to 10 seconds
+    try:
+        poll_interval = int(os.getenv('POLL_INTERVAL', '10'))
+    except ValueError:
+        poll_interval = 10
+        print(f"Warning: Invalid POLL_INTERVAL in .env, using default of {poll_interval} seconds")
+
     # Parse user IDs from environment variable
     users_str = os.getenv('USER_IDS', '14852499')
     try:
@@ -181,13 +219,13 @@ def main():
     except ValueError:
         print("Error: User IDs in .env file must be integers separated by commas")
         sys.exit(1)
-        
+
     # Fallback to command line arguments if provided
     if len(sys.argv) > 1:
         client_id = sys.argv[1]
         client_secret = sys.argv[2]
         output_file = sys.argv[3] if len(sys.argv) > 3 else output_file
-        
+
         # Parse user IDs if provided
         if len(sys.argv) > 4:
             try:
@@ -195,39 +233,45 @@ def main():
             except ValueError:
                 print("Error: User IDs must be integers separated by commas")
                 sys.exit(1)
-    
+
     # Load existing scores to prevent duplicates
-    existing_hashes = load_existing_scores(output_file)
+    print(f"Loading existing scores from {output_file}...")
+    existing_hashes, existing_ids = load_existing_scores(output_file)
     print(f"Loaded {len(existing_hashes)} existing score hashes")
-    
+
     # Get initial token
     print(f"Starting to monitor scores for users: {users}")
     print(f"Results will be saved to: {output_file}")
+    print(f"Polling every {poll_interval} seconds")
     token = get_oauth_token(client_id, client_secret)
 
     try:
         total_scores_added = 0
 
         while True:
-            scores = get_scores(token)
-            if scores:
-                added, new_hashes = process_scores_for_users(scores, users, output_file, existing_hashes)
+            for user_id in users:
+                print(f"Getting scores for user {user_id}...")
+                scores = get_user_scores(token, user_id)
                 
-                # Update our hash set with new scores
-                existing_hashes.update(new_hashes)
-                total_scores_added += added
-                
-                if added > 0:
-                    print(f"Total scores tracked so far: {total_scores_added}")
-            
-            # Sleep for 5 seconds before next poll
-            print("Waiting 5 seconds for next poll...")
-            time.sleep(5)
-            
+                if scores:
+                    added, new_hashes, new_ids = process_scores(scores, output_file, existing_hashes, existing_ids)
+
+                    # Update our hash set and ID set with new scores
+                    existing_hashes.update(new_hashes)
+                    existing_ids.update(new_ids)
+                    total_scores_added += added
+
+                    if added > 0:
+                        print(f"Total scores tracked so far: {total_scores_added}")
+
+            # Sleep before next poll
+            print(f"Waiting {poll_interval} seconds for next poll...")
+            time.sleep(poll_interval)
+
     except KeyboardInterrupt:
         print("\nMonitoring stopped by user")
         print(f"Total scores tracked: {total_scores_added}")
-        
+
     except Exception as e:
         print(f"Error: {e}")
         # Try to refresh token on error
