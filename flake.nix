@@ -32,7 +32,8 @@
           '';
         };
 
-        apps.default = {
+
+	apps.default = {
           type = "app";
           program = toString (pkgs.writeShellScript "run-main" ''
             #!/bin/sh
@@ -42,4 +43,3 @@
         };
       });
 }
-

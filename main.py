@@ -204,9 +204,10 @@ def main():
     print(f"Starting to monitor scores for users: {users}")
     print(f"Results will be saved to: {output_file}")
     token = get_oauth_token(client_id, client_secret)
-    
+
     try:
         total_scores_added = 0
+
         while True:
             scores = get_scores(token)
             if scores:
